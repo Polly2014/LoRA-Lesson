@@ -18,6 +18,10 @@ lesson2/checkpoints/*.safetensors
 # Solution (not public)
 lesson1/solution.ipynb
 
+# Internal planning & Marp source (not public)
+PLAN.md
+**/slides.md
+
 # Lesson 2 (not ready yet)
 lesson2/
 
