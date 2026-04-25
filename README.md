@@ -79,13 +79,11 @@ jupyter lab
 
 ## 📚 第一课 · 原理 + 手撕 LoRA（3h）
 
-| 时段 | 内容 |
+| Part | 内容 |
 |------|------|
-| 0:00–0:40 | 动机（显存账） + 数学（$W + \frac{\alpha}{r}BA$） |
-| 0:40–1:40 | 手撕 `LoRALinear` + 挂到 Qwen2.5-0.5B |
-| 1:40–1:50 | ☕ 休息 |
-| 1:50–2:50 | Rank + Target Ablation + SVD 可视化 |
-| 2:50–3:00 | 作业 + Q&A |
+| Part 1 | 动机（显存账）+ 数学（$W + \frac{\alpha}{r}BA$） |
+| Part 2 | 手撕 `LoRALinear` + 挂到 Qwen2.5-0.5B + Rank/Target Ablation |
+| Part 3 | SVD 可视化 + 作业 + Q&A |
 
 **核心产出**：用 ~30 行 PyTorch 实现 LoRA，在 T4 上 5 分钟跑完中文情感分类微调，可训练参数仅占 0.16%。
 
@@ -95,15 +93,11 @@ jupyter lab
 
 ## 🛠️ 第二课 · 框架实操：外贸术语 QA（3h）
 
-| 时段 | 内容 |
+| Part | 内容 |
 |------|------|
-| 0:00–0:35 | PEFT + QLoRA 原理 + 数据/SFTTrainer 配置 |
-| 0:35–0:45 | ☕ 休息 |
-| 0:45–1:40 | 训练（跑起来 + 调参观察） |
-| 1:40–1:50 | ☕ 休息 |
-| 1:50–2:20 | 合并权重 + 推理对比 + 盲测打分 |
-| 2:20–2:35 | 部署 demo（老师演示） |
-| 2:35–3:05 | 组间展示评比 |
+| Part 1 | PEFT + QLoRA 原理 + 数据/SFTTrainer 配置 |
+| Part 2 | 训练（跑起来 + 调参观察）|
+| Part 3 | 合并权重 + 推理对比 + 盲测打分 + 部署 demo + 组间展示 |
 
 **核心产出**：用 `peft` + QLoRA 微调 Qwen2.5-1.5B-Instruct 到外贸 QA 场景，盲测集 BLEU/ROUGE-L 相对基座提升 ≥ 5 分，adapter 仅 30-40 MB。
 
