@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Model checkpoints (large files)
+lesson1/checkpoints/*.pt
+lesson1/checkpoints/*.bin
+lesson2/checkpoints/*.pt
+lesson2/checkpoints/*.bin
+lesson2/checkpoints/*.safetensors
+
+# Solution (not public)
+lesson1/solution.ipynb
+
+# Lesson 2 (not ready yet)
+lesson2/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Virtual environments
+.venv/
+venv/
