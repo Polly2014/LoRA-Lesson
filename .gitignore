@@ -23,8 +23,11 @@ PLAN.md
 CLAUDE.md
 **/slides.md
 
-# Lesson 2 (not ready yet)
-lesson2/
+# Speaker notes (internal teaching script)
+**/speaker_notes.md
+
+# Dataset build scripts (may contain API keys / synthesis prompts)
+lesson2/data/build_dataset.py
 
 # OS
 .DS_Store

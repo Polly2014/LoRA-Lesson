@@ -419,3 +419,424 @@ LABEL2TEXT = {0: "0",      1: "1"}       # 数字字符串
 > **数据集只给原料（文本 + 整数标签），怎么把原料拼成 prompt → completion 序列，是你设计的。LoRA 学的是你设计的这个映射。**
 
 这正是 instruction tuning 时代算法工程师的核心活：**Prompt + Completion 的格式设计**。Lesson 2 用 `peft` + 外贸 QA 时会看到更复杂的 prompt 设计（chat template）。
+
+---
+
+## A11. PEFT 家族详解 — Prompt Tuning / Prefix Tuning / LoRA / QLoRA
+
+第二课 slides "2.1 PEFT 家族全景" 那个表格的展开版。学生最容易混淆的是 **Prompt Tuning ≠ Prefix Tuning**，重点讲清这两个的差别。
+
+### PEFT 五大流派一句话总览
+
+| 方法 | 在哪儿动手 | 可训练参数 | 工业界用途 |
+|------|----------|-----------|-----------|
+| **Prompt Tuning** | Embedding 层（输入最前面加 soft prompt） | ~0.001% | 极小参数 / Edge |
+| **Prefix Tuning** | 每层 Attention 的 KV（加可训练 prefix） | ~0.25% | 多任务适配器 |
+| **LoRA** | 每个 Linear 的权重更新 $\Delta W = BA$ | ~0.5–1% | **主流（本课）** |
+| **QLoRA** | LoRA + 4bit NF4 量化底座 | ~0.5–1% | 大模型微调 |
+| **DoRA / AdaLoRA** | LoRA 的改良（幅度/方向解耦、自适应秩） | ~0.5–1% | 前沿研究 |
+
+### Prompt Tuning（最浅）
+
+**做什么**：在输入 token embedding 的最前面，拼上一段可训练的"虚拟 token"向量。
+
+```
+标准输入：    [emb(请), emb(解释), emb(FOB)]                          shape: (3, 4096)
+Prompt Tuning：[p_0, p_1, p_2, p_3, p_4, emb(请), emb(解释), emb(FOB)]  shape: (8, 4096)
+              ↑ 这 5 个可训练，其他全冻结
+```
+
+**可训练参数量**：`prefix_len × hidden_size`，例如 5 × 4096 = 20 KB ≈ 0.001%
+
+**损失计算**：soft prompt 段的 label 全设为 `-100`，只对真实输入段算 loss。
+
+```python
+labels = torch.cat([
+    torch.full((1, 5), -100),     # soft prompt 段：不算 loss
+    real_input_ids                  # 真实段：算 loss
+], dim=1)
+```
+
+**反向传播**：只对 `soft_prompt` 这一个张量求梯度，Transformer 权重完全冻结。
+
+**类比**：给医生贴张"咒语卡片"在胸口，医术本身没变，只是被"提示"了。
+
+**短板**：效果一般。Prompt Tuning 只改"输入上下文"，没动 Transformer 内部，对需要真正改变行为的任务（QA、领域知识）力不从心。小模型上更弱（原论文用 T5-XL 3B 才有效）。
+
+### Prefix Tuning（中等深度）
+
+**做什么**：不是在输入加 prompt，而是在**每一层 Attention 的 K 和 V** 前面加一段可训练的 prefix。
+
+```python
+# 每层 Attention 内部
+Q = x @ W_q                                                # 正常
+K = torch.cat([prefix_k[layer_idx], x @ W_k], dim=1)       # ← 前面加 prefix_k
+V = torch.cat([prefix_v[layer_idx], x @ W_v], dim=1)       # ← 前面加 prefix_v
+attn = softmax(Q @ K.T / sqrt(d)) @ V
+```
+
+**关键**：每层有**独立**的 prefix KV 参数（24 层就有 24 组）。
+
+**可训练参数量**：
+
+$$\text{params} = \text{num\_layers} \times 2 \times \text{prefix\_len} \times \text{hidden\_size}$$
+
+例如 Qwen2.5-1.5B（24 层、4096 维）、prefix_len=20：
+
+$$24 \times 2 \times 20 \times 4096 \approx 3.9\text{M} \approx 0.25\%$$
+
+**比 Prompt Tuning 多 ~250 倍参数，但效果接近全量微调**（SuperGLUE 上只差 0.2 分 vs Prompt Tuning 差 1.7 分，Li & Liang 2021）。
+
+**类比**：医生大脑每个区域（每层 Attention）都被"激活"了，每个脑区有自己的"前缀记忆"——直接影响诊断逻辑，不只是心理暗示。
+
+### LoRA（本课主角）
+
+**做什么**：在每个 Linear 层旁边并联一组低秩矩阵 $A \in \mathbb{R}^{r \times d}$、$B \in \mathbb{R}^{d \times r}$，前向时：
+
+$$h = W_0 x + \frac{\alpha}{r} \cdot B A x$$
+
+$W_0$ 冻结，只训 $A$、$B$。
+
+**可训练参数量**：`2 × r × hidden_size × num_target_modules × num_layers`，r=8 时约 0.5–1%。
+
+**和 Prefix Tuning 的本质区别**：
+- Prefix Tuning 改的是 attention 的 **KV 输入**（序列变长）
+- LoRA 改的是 **权重本身**（序列不变）
+
+→ LoRA 推理时可以 `merge_and_unload` 把 $\Delta W$ 加回 $W_0$，**零额外开销**；Prefix Tuning 永远要带着 prefix 跑。
+
+### QLoRA（LoRA 的省显存版）
+
+LoRA 的扩展：底座先 4bit NF4 量化（冻结、不参与梯度），LoRA 的 A/B 矩阵仍用 fp16/bf16 训练。
+
+**适用场景**：单卡 GPU 想训大模型（7B / 13B / 70B）。本课在 1.5B 用 QLoRA 主要是**教学统一**（让 Kaggle T4 体验完整流程），1.5B 其实直接 fp16 LoRA 也跑得下。
+
+### 为什么本课选 LoRA/QLoRA 而不是 Prefix Tuning？
+
+| 维度 | Prefix Tuning | LoRA | 选 LoRA 的原因 |
+|------|--------------|------|---------------|
+| 可解释性 | "prefix 记忆"抽象 | $\Delta W = BA$ 数学清晰 | 第一课已铺垫 |
+| 代码 | 要 hack Attention 内部 | `peft` 一行配置 | 工程简单 |
+| 推理 | 永远要带 prefix | 可合并回底座 | 部署友好 |
+| 社区 | 实现少 | HuggingFace / Unsloth / vLLM 全支持 | 生态成熟 |
+
+### 学生常见追问
+
+**Q: 那 Prompt Tuning / Prefix Tuning 还有用吗？**
+
+A: 有，但场景窄。Prompt Tuning 适合**多任务热切换**——给每个任务存一套 soft prompt（20 KB），推理时根据任务切换 embedding 拼接。LoRA 也能做（adapter 几十 MB），但 Prompt Tuning 更轻。
+
+**Q: Prefix Tuning 既然效果好，为什么没火起来？**
+
+A: 三个原因：(1) 推理时序列变长，KV cache 永远多带一段；(2) 实现要 hack Transformer，没有 LoRA 那种"挂适配器"的优雅；(3) LoRA 后来居上，效果相当 + 工程简单。
+
+---
+
+## A12. NF4 量化深入 — 为什么是"Normal Float"
+
+A1 给了 NF4 在精度家族中的位置。这里展开 **NF4 vs INT4** 的本质差异，以及"Normal"的含义。
+
+### 全称对照
+
+| 缩写 | 全称 | 中文 |
+|------|------|------|
+| **INT4** | **Integer 4-bit** | 4 位整数（均匀量化） |
+| **NF4** | **Normal Float 4-bit** | 4 位"正态浮点"（非均匀量化） |
+
+**"Normal"指正态分布（Normal Distribution）**，不是"普通"。
+
+### 关键观察 — 神经网络权重接近正态分布
+
+Dettmers 2023 的核心 insight：**预训练完的 Transformer 权重高度服从** $\mathcal{N}(0, \sigma^2)$。
+
+```
+频率
+  |       ╱╲
+  |      ╱  ╲       ← 权重主要集中在 0 附近
+  |     ╱    ╲
+  |    ╱      ╲
+  |___╱________╲___
+      -σ  0  +σ
+```
+
+如果用 INT4 那样**等距分割**，大部分量化等级都浪费在权重很少出现的区域（两端），中间密集区反而粒度太粗 → 精度损失大。
+
+### INT4 vs NF4 量化等级对比
+
+```
+INT4（均匀等距 16 等级）：
+  -1.00, -0.87, -0.73, -0.60, -0.47, -0.33, -0.20, -0.07,
+   0.07,  0.20,  0.33,  0.47,  0.60,  0.73,  0.87,  1.00
+  ↑ 等距 0.13，中间和两端粒度一样
+
+NF4（按正态分布分位数 16 等级）：
+  -1.00, -0.696, -0.525, -0.395, -0.284, -0.185, -0.091, 0.0,
+   0.080, 0.161,  0.246,  0.338,  0.441,  0.563,  0.723, 1.0
+  ↑ 中间密集（粒度细）、两端稀疏（粒度粗）
+```
+
+### NF4 的设计原理（一句话）
+
+> NF4 的 16 个量化等级，是 $\mathcal{N}(0,1)$ 的 **16 个等概率分位点**。
+
+→ 每个量化"桶"里落进去的权重数量**大致相等**，信息利用率达到理论最优。
+
+### 通俗比喻
+
+- **INT4** = 用统一尺寸的箱子装水果（常见水果的箱子堆满了，少见水果的箱子空着）
+- **NF4** = 根据水果分布调整箱子大小（常见水果用小箱子分细，少见水果用大箱子粗放）
+
+### 实验效果（Dettmers 2023）
+
+在 LLaMA-65B 上，NF4 量化后的 5-shot MMLU 分数与 fp16 几乎无差距（差距 < 0.5%），而 INT4 会掉 2–3 个点。这就是 QLoRA 论文最重要的实验结论之一。
+
+### 一句话给学生
+
+> "INT4 把直线均匀切 16 段，NF4 按正态分布的'人口密度'切——常见区域切得细、少见区域切得粗，4 个 bit 用得最值。"
+
+---
+
+## A13. 双重量化（Double Quantization）— "量化常数本身也量化"
+
+A1 提了一句"双重量化"，这里展开。这是 QLoRA 三大技术里**最容易跳过、但最体现工程巧思**的一项。
+
+### 问题：量化常数本身占显存
+
+NF4 量化不是单纯把 fp16 砍成 4bit。每**一组**权重（通常 64 个）共享一个 **scaling factor**（缩放常数），用来恢复原始数值范围：
+
+```python
+# 伪代码
+group_max = max(abs(weights[i*64 : (i+1)*64]))    # 这一组的最大绝对值
+scale = group_max / 7                              # 4bit 有符号能表示 -8 ~ +7
+quantized = round(weights / scale).clip(-8, 7)     # 量化到 INT4
+# 反量化时：dequant = quantized × scale
+```
+
+**这个 `scale` 必须存着**，否则反量化时不知道还原成多大。
+
+**显存账（Qwen2.5-1.5B）**：
+
+```
+权重总数：         1.5 B
+分组大小：         64
+组数：             1.5B / 64 = 23.4 M 组
+每组 scale 占用：  fp16 = 2 byte
+量化常数总占用：   23.4M × 2 byte ≈ 47 MB
+```
+
+权重本身才 0.75 GB，光量化常数就要 47 MB —— **占比 6%**，不容忽视。
+
+### 解决方案：对 scale 再做一次 8bit 量化
+
+```
+第一层量化：
+  权重 (fp16) ─NF4量化─→ 权重_4bit + scale_1 (fp16)
+                                     ↓
+第二层量化：把这堆 scale_1 再分组（每 256 个一组）
+  scale_1 (fp16) ─INT8量化─→ scale_1_int8 + scale_2 (fp32)
+```
+
+每 256 个 scale_1 共享一个 scale_2，所以 scale_2 数量极少（23.4M / 256 ≈ 91K 个，占用 < 1 MB）。
+
+### 节省效果
+
+| | 一次量化 | 双重量化 |
+|---|---------|---------|
+| 权重 | 0.75 GB | 0.75 GB |
+| 第一层 scale (fp16) | **47 MB** | 23 MB (压成 INT8) |
+| 第二层 scale (fp32) | — | 0.4 MB |
+| **合计** | **~800 MB** | **~775 MB** |
+| **节省** | — | **~25 MB（≈ 3%）** |
+
+数字看着不大，但放到 70B 模型上能省 1 GB+。"省下的每一 MB 都能让 batch_size 多 1"是大模型工程的金科玉律。
+
+### 通俗比喻
+
+- 一次量化：把大象装进冰箱（权重 → 4bit），但冰箱旁边还堆着一堆说明书（scale）
+- 双重量化：连说明书也压缩成卡片（scale → INT8）
+
+### 一句话给学生
+
+> "权重量化了，**记录怎么还原权重的那个 scale 也量化一次**——这就叫双重量化。技巧虽小，但体现了 QLoRA '榨干每一 MB' 的工程哲学。"
+
+---
+
+## A14. Paged Optimizer — 借用 OS 虚拟内存思想
+
+QLoRA 三技术的最后一项。这是 `bitsandbytes` 提供的、`optim="paged_adamw_8bit"` 背后的机制。
+
+### 问题：训练时显存峰值经常爆掉
+
+QLoRA 把权重压到 0.9 GB、LoRA 参数+梯度+optimizer state 也只占 100 MB 左右，但**激活值缓存（activations）** 在长序列时会膨胀：
+
+```
+激活值 ≈ batch_size × seq_len × hidden_size × num_layers × bytes_per_value × overhead
+
+例：batch=2, seq_len=2048, hidden=4096, layers=24, fp16
+   = 2 × 2048 × 4096 × 24 × 2 byte
+   ≈ 1.6 GB（不开 gradient checkpointing）
+```
+
+如果某个 batch 的序列特别长，激活值瞬间冲到 5–6 GB，整个显存就到红线了。一旦 OOM —— **训练直接 crash**，前面跑的全白费。
+
+### 解决方案：把 optimizer state 分页，溢出时换到 CPU
+
+灵感来自操作系统的**虚拟内存（virtual memory）**：进程的内存看起来是连续大的，实际由 OS 分页（page）管理，物理内存不够时把不活跃的页换到磁盘（swap）。
+
+Paged Optimizer 把 AdamW 的 `m`（一阶动量）、`v`（二阶动量）分成小页（page），驻留在 GPU 显存。当 GPU 显存吃紧（如激活值突然变大）：
+
+```
+正常时：
+  GPU: [模型(0.9G) | LoRA+grad(0.1G) | optim_state(0.1G) | activations(4G)] ≈ 5.1G ✓
+
+序列变长瞬间：
+  需要 activations 6G，但 GPU 只剩 5G
+  ↓
+  Paged Optimizer 触发：
+  把 optim_state 的 0.05G 换到 CPU 内存
+  ↓
+  GPU: [模型(0.9G) | LoRA+grad(0.1G) | optim_state(0.05G) | activations(6G)] ≈ 7.05G ✓
+  CPU 内存: [optim_state_swapped(0.05G)]
+```
+
+需要那部分 optimizer state 时，再从 CPU 读回 GPU。**整个过程对用户透明，靠 NVIDIA Unified Memory 在底层做 page fault 处理。**
+
+### 实际配置（notebook 里就一行）
+
+```python
+TrainingArguments(
+    ...
+    optim="paged_adamw_8bit",     # ← 这就开启了 Paged Optimizer
+    ...
+)
+```
+
+`paged_adamw_8bit` 还顺带做了 optimizer state 的 8bit 量化（m、v 从 fp32 压到 INT8），双管齐下进一步省显存。
+
+### 副作用
+
+- **轻微变慢**：CPU↔GPU 数据传输有延迟，比纯 GPU 慢 5–15%
+- **要求 NVIDIA Unified Memory**：旧卡（K80、P40）可能不支持
+- **CPU 内存够大**：通常需要 ≥ 32 GB 系统内存
+
+### 通俗比喻
+
+- 标准 AdamW：只用桌子放东西，桌子满了就摔东西（OOM crash）
+- Paged Optimizer：桌子 + 旁边柜子（CPU 内存），桌子满了把不常用的塞柜子里，要用再拿回来 —— **不会 crash**
+
+### 一句话给学生
+
+> "训练的核心痛点是'激活值突发膨胀导致 OOM'。Paged Optimizer 借 OS 虚拟内存的思想，把 optimizer state 当成'可换页内存'，显存吃紧时自动溢出到 CPU，平稳渡过峰值。"
+
+---
+
+## A15. QLoRA 显存账 — 6GB 是怎么算出来的
+
+第二课 slides "2.3 为什么能压到这么小" 的表格反推，给学生完整推导。
+
+### 总账对比
+
+| 存储项 | 全量微调 (fp16) | QLoRA |
+|-------|----------------|-------|
+| 模型参数 | 3 GB (fp16) | 0.9 GB (4bit NF4 + 双重量化) |
+| 梯度 | 3 GB | ~35 MB（只对 LoRA） |
+| AdamW state (m + v) | 6 GB（2×参数，fp32） | ~70 MB（只对 LoRA） |
+| 激活值（seq=512, bs=2） | ~4 GB | ~4 GB |
+| **合计** | **~16 GB** | **~5–6 GB** ✓ |
+
+→ Kaggle T4（16 GB）全量 1.5B 都已经勉强（只剩 0 GB 余量，长序列必爆），QLoRA 留出 10 GB 余量，**可以舒舒服服训 7B 模型**。
+
+### QLoRA 5GB 的详细拆解
+
+#### 1. 量化基座（冻结，不训练）
+
+```
+Qwen2.5-1.5B = 1.55B 参数
+NF4 量化：    1.55B × 4 bit / 8 = 0.775 GB
++ 双重量化后的 scale 常数：~25 MB
+────────────────────────────────
+合计：         ~0.9 GB
+```
+
+#### 2. LoRA 可训练部分（fp16）
+
+```
+target_modules = [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]  # 7 个
+r = 8
+
+每个 Linear 的 LoRA 参数：
+  A 矩阵：(r, hidden_in)  = (8, 4096)   → 32 K 参数
+  B 矩阵：(hidden_out, r) = (4096, 8)   → 32 K 参数
+  小计：~64 K 参数 × 2 byte (fp16) = 128 KB
+
+⚠ 注意 GQA：k_proj/v_proj 的 hidden_out 只有 256（不是 4096），所以参数更少。
+   这里只算粗估。
+
+全部 LoRA 总参数：
+  ≈ 24 层 × 7 modules × 平均 50K params ≈ 8.4 M 参数
+  
+显存占用：8.4 M × 2 byte (fp16) ≈ 17 MB
+（PEFT 实际打印通常显示 8.8M / 1.55B ≈ 0.566%）
+```
+
+#### 3. 梯度（只对 LoRA）
+
+```
+LoRA 参数有梯度，量级和参数本身相同：
+  ≈ 17 MB
+```
+
+#### 4. AdamW Optimizer State
+
+```
+AdamW 对每个可训练参数存 m（一阶动量）+ v（二阶动量）：
+  paged_adamw_8bit：m + v 压成 INT8 → 8.4M × 1 byte × 2 = ~17 MB
+  普通 adamw_fp32： m + v 用 fp32 → 8.4M × 4 byte × 2 = ~67 MB
+
+我们用 paged_adamw_8bit：~17 MB
+```
+
+#### 5. 激活值（**显存大头**）
+
+这是不容易省的部分，公式：
+
+```
+activations ≈ batch × seq_len × hidden × num_layers × dtype × overhead
+            ≈ 2 × 512 × 4096 × 24 × 2 byte × 1.5
+            ≈ 600 MB（开 gradient checkpointing）
+
+不开 gradient checkpointing 会膨胀到 ~4 GB。
+QLoRA 必开 gradient_checkpointing=True。
+```
+
+#### 总账
+
+```
+量化基座            ≈ 0.9 GB
+LoRA 参数            ≈ 17 MB
+LoRA 梯度            ≈ 17 MB
+AdamW state (8bit)   ≈ 17 MB
+激活值 (with ckpt)   ≈ 0.6–1.5 GB（动态）
+临时 buffer / fragment ≈ 0.5 GB
+─────────────────────────────────
+合计                 ≈ 2–4 GB（小 batch）
+                       4–6 GB（大 batch / 长序列）
+```
+
+### Slides 表格里"4 GB 激活值"的口径
+
+Slides 上写的是 **不开 gradient checkpointing** 的口径（让对比更明显）。实际跑 notebook 会开 `gradient_checkpointing=True`，激活值会进一步降到 1 GB 量级。
+
+### 学生常见追问
+
+**Q: 那为什么不全量微调 1.5B？反正只占 16 GB。**
+
+A: (1) 16 GB 完全占满 = 0 余量，任何长序列、batch 微调都会 OOM；(2) 全量微调改了模型的所有权重，**很容易破坏底座原有能力**（catastrophic forgetting），1500 条数据训完可能连基础对话都不会了；(3) LoRA 只动 0.5% 参数，**有强力的正则化效果**，泛化更好。
+
+**Q: QLoRA 能训多大模型？**
+
+A: Kaggle T4 (16 GB) → 舒适训 7B、勉强训 13B；A100 (80 GB) → 舒适训 70B（QLoRA 原论文就是这么干的）。
+
+### 一句话给学生
+
+> "全量微调 = 模型 1× + 梯度 1× + AdamW 2× = **4× 参数显存**；QLoRA = 基座 0.3× + LoRA 部分忽略不计 + 激活值 = **0.3–0.5× 参数显存**。这就是为什么 T4 能跑 7B、A100 能跑 70B。"
